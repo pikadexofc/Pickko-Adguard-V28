@@ -135,8 +135,6 @@ public class VpnPlugin extends Plugin {
 
         JSArray logs = new JSArray();
         List<String> recentLogs = LocalVpnService.getRecentActivity();
-        // Reverse to show latest first in UI
-        Collections.reverse(recentLogs);
         for (String activity : recentLogs) {
             logs.put(activity);
         }

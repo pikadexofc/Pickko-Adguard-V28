@@ -198,6 +198,17 @@ public class LocalVpnService extends VpnService {
 
             byte[] dnsData = new byte[length - ihl - 8];
             System.arraycopy(packet, ihl + 8, dnsData, 0, dnsData.length);
+            
+            // ... (rest of method)
+
+            byte[] cached = DNS_RESULT_CACHE.get(host);
+            if (cached != null) {
+                sendResponse(packet, ihl, cached, out);
+                return;
+            }
+
+            byte[] dnsData = new byte[length - ihl - 8];
+            System.arraycopy(packet, ihl + 8, dnsData, 0, dnsData.length);
 
             try (DatagramSocket socket = new DatagramSocket()) {
                 protect(socket); // Critical: Bypass VPN for upstream call
