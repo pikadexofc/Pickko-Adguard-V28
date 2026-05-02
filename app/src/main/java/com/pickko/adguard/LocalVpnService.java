@@ -201,19 +201,19 @@ public class LocalVpnService extends VpnService {
             
             // ... (rest of method)
 
-            byte[] cached = DNS_RESULT_CACHE.get(host);
-            if (cached != null) {
-                sendResponse(packet, ihl, cached, out);
+            byte[] cachedVal = DNS_RESULT_CACHE.get(host);
+            if (cachedVal != null) {
+                sendResponse(packet, ihl, cachedVal, out);
                 return;
             }
 
-            byte[] dnsData = new byte[length - ihl - 8];
-            System.arraycopy(packet, ihl + 8, dnsData, 0, dnsData.length);
+            byte[] dnsReqData = new byte[length - ihl - 8];
+            System.arraycopy(packet, ihl + 8, dnsReqData, 0, dnsReqData.length);
 
             try (DatagramSocket socket = new DatagramSocket()) {
                 protect(socket); // Critical: Bypass VPN for upstream call
                 socket.setSoTimeout(2500);
-                DatagramPacket q = new DatagramPacket(dnsData, dnsData.length, InetAddress.getByName(upstreamDns), 53);
+                DatagramPacket q = new DatagramPacket(dnsReqData, dnsReqData.length, InetAddress.getByName(upstreamDns), 53);
                 socket.send(q);
 
                 byte[] buf = new byte[4096];
