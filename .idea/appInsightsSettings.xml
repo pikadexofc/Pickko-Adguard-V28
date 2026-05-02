@@ -8,10 +8,10 @@
             <InsightsFilterSettings>
               <option name="connection">
                 <ConnectionSetting>
-                  <option name="appId" value="PLACEHOLDER" />
-                  <option name="mobileSdkAppId" value="" />
-                  <option name="projectId" value="" />
-                  <option name="projectNumber" value="" />
+                  <option name="appId" value="com.pickko.adguard" />
+                  <option name="mobileSdkAppId" value="1:355842435614:android:172ac20bf2c176e32adc0f" />
+                  <option name="projectId" value="studio-473807792-cf2c0" />
+                  <option name="projectNumber" value="355842435614" />
                 </ConnectionSetting>
               </option>
               <option name="signal" value="SIGNAL_UNSPECIFIED" />

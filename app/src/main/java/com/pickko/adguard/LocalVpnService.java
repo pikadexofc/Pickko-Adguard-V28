@@ -186,6 +186,7 @@ public class LocalVpnService extends VpnService {
 
             if (blocked) {
                 blockedQueries.incrementAndGet();
+                sendNxDomainResponse(packet, ihl, out); // FASTER: Tell browser it's gone immediately
                 return;
             }
 
@@ -246,6 +247,33 @@ public class LocalVpnService extends VpnService {
         resp[ihl + 6] = 0; resp[ihl + 7] = 0; // Clear UDP Checksum
 
         synchronized (out) { out.write(resp); }
+    }
+
+    private void sendNxDomainResponse(byte[] req, int ihl, FileOutputStream out) throws IOException {
+        // DNS Header for NXDOMAIN (Name Error)
+        byte[] nxData = new byte[12];
+        System.arraycopy(req, ihl + 8, nxData, 0, 12); // Copy original ID
+        nxData[2] = (byte) 0x81; // Response, recursive
+        nxData[3] = (byte) 0x83; // NXDOMAIN error code
+        nxData[4] = 0; nxData[5] = 1; // 1 Question
+        nxData[6] = 0; nxData[7] = 0; // 0 Answer
+        nxData[8] = 0; nxData[9] = 0; // 0 Authority
+        nxData[10] = 0; nxData[11] = 0; // 0 Additional
+        
+        // Find end of question in original request to mirror it
+        int p = ihl + 8 + 12;
+        while (p < req.length) {
+            int len = req[p] & 0xFF;
+            if (len == 0) { p += 5; break; } // Null terminator + Type/Class (4 bytes)
+            p += len + 1;
+        }
+        
+        int questionLen = p - (ihl + 8 + 12);
+        byte[] fullNx = new byte[12 + questionLen];
+        System.arraycopy(nxData, 0, fullNx, 0, 12);
+        System.arraycopy(req, ihl + 8 + 12, fullNx, 12, questionLen);
+
+        sendResponse(req, ihl, fullNx, out);
     }
 
     private int calcSum(byte[] b, int len) {
