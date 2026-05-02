@@ -26,6 +26,8 @@ import com.google.android.gms.ads.MobileAds;
 import androidx.annotation.NonNull;
 
 import java.net.InetAddress;
+import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import androidx.activity.result.ActivityResult;
 
@@ -132,10 +134,11 @@ public class VpnPlugin extends Plugin {
         ret.put("stats", stats);
 
         JSArray logs = new JSArray();
-        synchronized (LocalVpnService.recentActivity) {
-            for (String activity : LocalVpnService.recentActivity) {
-                logs.put(activity);
-            }
+        List<String> recentLogs = LocalVpnService.getRecentActivity();
+        // Reverse to show latest first in UI
+        Collections.reverse(recentLogs);
+        for (String activity : recentLogs) {
+            logs.put(activity);
         }
         ret.put("recentActivity", logs);
 
