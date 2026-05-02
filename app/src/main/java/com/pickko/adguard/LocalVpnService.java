@@ -7,23 +7,34 @@ import android.content.Intent;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
+import android.system.Os;
+import android.system.OsConstants;
 import android.util.Log;
+import android.util.LruCache;
 
 import androidx.core.app.NotificationCompat;
 
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
+import java.io.FileDescriptor;
 import java.io.IOException;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.LongBuffer;
+import java.nio.channels.DatagramChannel;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class LocalVpnService extends VpnService {
@@ -35,15 +46,29 @@ public class LocalVpnService extends VpnService {
 
     public static final AtomicLong totalQueries = new AtomicLong(0);
     public static final AtomicLong blockedQueries = new AtomicLong(0);
-    public static final List<String> recentActivity = Collections.synchronizedList(new ArrayList<>());
+    
+    // --- Phase 5: Lock-Free Atomic Ring Buffer ---
     private static final int MAX_ACTIVITY_LOGS = 10;
+    private static final String[] activityRingBuffer = new String[MAX_ACTIVITY_LOGS];
+    private static final AtomicInteger ringIndex = new AtomicInteger(0);
+    public static final List<String> recentActivity = new ArrayList<>(); // Legacy bridge for UI polling
 
     private ParcelFileDescriptor vpnInterface = null;
     private Thread vpnThread = null;
     private ExecutorService executorService = null;
+    private Selector selector = null;
     private static final String CHANNEL_ID = "vpn_channel";
     private static final int NOTIFICATION_ID = 1;
+    
     private static final Map<String, String[]> DNS_PROVIDERS = new HashMap<>();
+    
+    // --- Phase 2 & 4: Radix Trie for Suffix Matching ---
+    private static final TrieNode TRIE_ROOT = new TrieNode();
+
+    private static final ConcurrentLinkedQueue<ByteBuffer> BUFFER_POOL = new ConcurrentLinkedQueue<>();
+    private static final int MAX_PACKET_SIZE = 32767;
+
+    private static final LruCache<String, byte[]> DNS_CACHE = new LruCache<>(500);
 
     static {
         DNS_PROVIDERS.put("AdGuard DNS", new String[]{"94.140.14.14", "94.140.15.15"});
@@ -51,6 +76,57 @@ public class LocalVpnService extends VpnService {
         DNS_PROVIDERS.put("NextDNS", new String[]{"45.90.28.0", "45.90.30.0"});
         DNS_PROVIDERS.put("Quad9", new String[]{"9.9.9.9", "149.112.112.112"});
         DNS_PROVIDERS.put("AdGuard Family", new String[]{"94.140.14.15", "94.140.15.16"});
+
+        String[] adNetworks = {
+            "doubleclick.net", "google-analytics.com", "applovin.com", "applvn.com",
+            "unity3d.com", "vungle.com", "ironsrc.com", "adcolony.com", "chartboost.com",
+            "adjust.com", "appsflyer.com", "crashlytics.com", "mopub.com", "supersonicads.com",
+            "tapjoy.com", "admob.com", "googleanalytics.com", "bugsnag.com", "media.net",
+            "sentry-cdn.com", "getsentry.com", "yahooinc.com", "yandex.ru", "yandex.net",
+            "unityads.unity3d.com", "tiktokv.com", "googletagmanager.com", "mixpanel.com",
+            "optimizely.com", "pangleglobal.com", "bnc.lt", "cookielaw.org", "cookiebot.com",
+            "onetrust.com", "trustarc.com", "jwpsrv.com", "jwpcdn.com", "fwmrm.net",
+            "connatix.com", "scorecardresearch.com", "skimresources.com", "viglink.com",
+            "linksynergy.com", "impact.com", "awin1.com", "shareasale.com", "ironSource.mobi",
+            "thetradedesk.com", "crypto-loot.org", "greatis.com", "ct.pinterest.com",
+            "mads-eu.amazon.com", "cdn.privacy-mgmt.com", "app.usercentrics.eu",
+            "anrdoezrs.net", "zenaps.com", "trackcmp.net", "dai.google.com", "indexexchange.com",
+            "tracking.miui.com", "data.mistat.xiaomi.com", "samsungqbe.com", "samsungacr.com",
+            "metrics.apple.com", "graph.facebook.com", "app-measurement.com", "branch.io",
+            "kochava.com", "singular.net", "segment.com", "flurry.com", "inmobi.com", "criteo.com",
+            "appboy.com", "braze.com", "raygun.io", "urbanairship.com", "clevertap.com",
+            "moengage.com", "localytics.com", "leanplum.com", "onesignal.com"
+        };
+        for (String domain : adNetworks) {
+            insertInverted(domain.toLowerCase());
+        }
+    }
+
+    private static void insertInverted(String domain) {
+        TrieNode curr = TRIE_ROOT;
+        String[] parts = domain.split("\\.");
+        for (int i = parts.length - 1; i >= 0; i--) {
+            curr = curr.children.computeIfAbsent(parts[i], k -> new TrieNode());
+        }
+        curr.isLeaf = true;
+    }
+
+    private static class TrieNode {
+        Map<String, TrieNode> children = new HashMap<>();
+        boolean isLeaf = false;
+    }
+
+    private ByteBuffer obtainBuffer() {
+        ByteBuffer buf = BUFFER_POOL.poll();
+        if (buf == null) {
+            buf = ByteBuffer.allocateDirect(MAX_PACKET_SIZE);
+        }
+        buf.clear();
+        return buf;
+    }
+
+    private void releaseBuffer(ByteBuffer buf) {
+        if (BUFFER_POOL.size() < 100) BUFFER_POOL.offer(buf);
     }
 
     @Override
@@ -74,7 +150,6 @@ public class LocalVpnService extends VpnService {
 
     private void startVpn(String provider, String mode) {
         if (vpnInterface != null) stopVpn();
-
         createNotificationChannel();
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Pickko Shield Active")
@@ -82,230 +157,244 @@ public class LocalVpnService extends VpnService {
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .build();
-
         startForeground(NOTIFICATION_ID, notification);
 
         Builder builder = new Builder();
         builder.setSession("Pickko Adguard");
-
-        // EXCLUDE THIS APP: Ensure AdMob and internal calls bypass the VPN
-        try {
-            builder.addDisallowedApplication(getPackageName());
-        } catch (Exception ignored) {}
-        
-        // IPv4 Routing
+        try { builder.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
         builder.addAddress("10.1.1.1", 24);
         builder.addDnsServer("10.1.1.2");
         builder.addRoute("10.1.1.2", 32);
-        
-        // IPv6 Routing (Prevents IPv6 leaks from freezing connections)
         builder.addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128);
         builder.addRoute("fd00:1:fd00:1:fd00:1:fd00:2", 128);
         builder.addDnsServer("fd00:1:fd00:1:fd00:1:fd00:2");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) builder.allowBypass();
 
-        // Allow non-DNS traffic to bypass the VPN seamlessly
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            builder.allowBypass();
-        }
-
-        String[] dnsServers = getDnsForProvider(provider);
-        final String upstreamDns = dnsServers[0];
-
+        String upstreamDns = getDnsForProvider(provider)[0];
         try {
             vpnInterface = builder.establish();
             if (vpnInterface != null) {
-                // Initialize thread pool for concurrent DNS queries
-                executorService = Executors.newCachedThreadPool();
+                executorService = Executors.newFixedThreadPool(Math.max(4, Runtime.getRuntime().availableProcessors() * 2));
+                selector = Selector.open();
                 startVpnThread(vpnInterface, upstreamDns);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "VPN Setup Failed", e);
-        }
+        } catch (Exception e) { Log.e(TAG, "VPN Setup Failed", e); }
     }
 
     private void startVpnThread(final ParcelFileDescriptor iface, final String upstreamDns) {
         vpnThread = new Thread(() -> {
-            try (FileInputStream in = new FileInputStream(iface.getFileDescriptor());
-                 FileOutputStream out = new FileOutputStream(iface.getFileDescriptor())) {
-                
-                byte[] packet = new byte[32767];
-                
-                while (!Thread.interrupted()) {
-                    int length = in.read(packet);
+            FileDescriptor fd = iface.getFileDescriptor();
+            ByteBuffer readBuffer = ByteBuffer.allocateDirect(MAX_PACKET_SIZE);
+            while (!Thread.interrupted()) {
+                try {
+                    readBuffer.clear();
+                    // --- Phase 1: Native OS Syscall ---
+                    int length = Os.read(fd, readBuffer);
                     if (length > 0) {
-                        // Clone packet data immediately so next read doesn't overwrite it
-                        byte[] packetCopy = new byte[length];
-                        System.arraycopy(packet, 0, packetCopy, 0, length);
-                        
-                        // Execute off the main loop to prevent queuing delays
-                        executorService.execute(() -> handlePacket(packetCopy, length, out, upstreamDns));
+                        readBuffer.flip();
+                        ByteBuffer packetCopy = obtainBuffer();
+                        packetCopy.put(readBuffer);
+                        packetCopy.flip();
+                        executorService.execute(() -> handlePacket(packetCopy, length, fd, upstreamDns));
                     }
-                }
-            } catch (IOException e) {
-                Log.e(TAG, "VPN Thread stopped");
+                } catch (Exception e) { break; }
             }
         });
         vpnThread.start();
+        
+        // --- Phase 3: Non-Blocking NIO Selector Thread ---
+        new Thread(() -> {
+            while (!Thread.interrupted() && selector != null) {
+                try {
+                    if (selector.select(1000) == 0) continue;
+                    Iterator<SelectionKey> keys = selector.selectedKeys().iterator();
+                    while (keys.hasNext()) {
+                        SelectionKey key = keys.next();
+                        keys.remove();
+                        if (key.isReadable()) {
+                            DatagramChannel channel = (DatagramChannel) key.channel();
+                            DnsContext ctx = (DnsContext) key.attachment();
+                            ByteBuffer respBuf = obtainBuffer();
+                            InetSocketAddress src = (InetSocketAddress) channel.receive(respBuf);
+                            if (src != null) {
+                                respBuf.flip();
+                                byte[] data = new byte[respBuf.remaining()];
+                                respBuf.get(data);
+                                DNS_CACHE.put(ctx.hostname, data);
+                                sendResponsePacket(ctx.requestPacket, ctx.ihl, data, ctx.vpnFd);
+                            }
+                            releaseBuffer(respBuf);
+                            channel.close();
+                            key.cancel();
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+        }).start();
     }
 
-    private void handlePacket(byte[] packet, int length, FileOutputStream out, String upstreamDns) {
-        try {
-            if (length < 28) return; 
-            int ihl = (packet[0] & 0x0F) * 4;
-            int protocol = packet[9] & 0xFF;
-            if (protocol != 17) return; // UDP
+    private static class DnsContext {
+        String hostname;
+        ByteBuffer requestPacket;
+        int ihl;
+        FileDescriptor vpnFd;
+        DnsContext(String h, ByteBuffer r, int i, FileDescriptor fd) {
+            hostname = h; requestPacket = r; ihl = i; vpnFd = fd;
+        }
+    }
 
-            int destPort = ((packet[ihl + 2] & 0xFF) << 8) | (packet[ihl + 3] & 0xFF);
+    private void handlePacket(ByteBuffer packet, int length, FileDescriptor vpnFd, String upstreamDns) {
+        try {
+            if (length < 28) return;
+            int ihl = (packet.get(0) & 0x0F) * 4;
+            int protocol = packet.get(9) & 0xFF;
+            if (protocol != 17) return;
+
+            int destPort = ((packet.get(ihl + 2) & 0xFF) << 8) | (packet.get(ihl + 3) & 0xFF);
             if (destPort == 53) {
                 totalQueries.incrementAndGet();
-                String hostname = parseDnsHostname(packet, ihl + 8, length);
-                
+                String hostname = parseDnsHostnameFast(packet, ihl + 8, length);
                 if (hostname != null) {
                     boolean blocked = isBlocked(hostname);
                     logActivity(hostname, blocked);
                     if (blocked) {
                         blockedQueries.incrementAndGet();
-                        return; // Drop the packet safely
+                        return;
+                    }
+                    byte[] cached = DNS_CACHE.get(hostname);
+                    if (cached != null) {
+                        sendResponsePacket(packet, ihl, cached, vpnFd);
+                        return;
                     }
                 }
 
-                byte[] dnsData = new byte[length - ihl - 8];
-                System.arraycopy(packet, ihl + 8, dnsData, 0, dnsData.length);
+                // --- Phase 3: Non-Blocking Upstream ---
+                DatagramChannel channel = DatagramChannel.open();
+                channel.configureBlocking(false);
+                channel.connect(new InetSocketAddress(upstreamDns, 53));
                 
-                // Use a fresh socket per query so concurrent requests don't mix up responses
-                try (DatagramSocket reqSocket = new DatagramSocket()) {
-                    InetAddress upstreamAddr = InetAddress.getByName(upstreamDns);
-                    DatagramPacket query = new DatagramPacket(dnsData, dnsData.length, upstreamAddr, 53);
-                    reqSocket.send(query);
-                    
-                    byte[] responseBuffer = new byte[4096];
-                    DatagramPacket response = new DatagramPacket(responseBuffer, responseBuffer.length);
-                    reqSocket.setSoTimeout(4000); // 4 seconds is plenty, doesn't block other threads anymore
-                    reqSocket.receive(response);
-                    
-                    byte[] returnPacket = new byte[ihl + 8 + response.getLength()];
-                    System.arraycopy(packet, 0, returnPacket, 0, ihl + 8);
-                    System.arraycopy(response.getData(), 0, returnPacket, ihl + 8, response.getLength());
-                    
-                    // Swap IPs
-                    System.arraycopy(packet, 12, returnPacket, 16, 4);
-                    System.arraycopy(packet, 16, returnPacket, 12, 4);
-                    
-                    // Swap Ports
-                    returnPacket[ihl] = packet[ihl + 2];
-                    returnPacket[ihl + 1] = packet[ihl + 3];
-                    returnPacket[ihl + 2] = packet[ihl];
-                    returnPacket[ihl + 3] = packet[ihl + 1];
-                    
-                    int udpLen = response.getLength() + 8;
-                    returnPacket[ihl + 4] = (byte)(udpLen >> 8);
-                    returnPacket[ihl + 5] = (byte)(udpLen & 0xFF);
-                    returnPacket[ihl + 6] = 0; 
-                    returnPacket[ihl + 7] = 0;
-
-                    int ipLen = returnPacket.length;
-                    returnPacket[2] = (byte)(ipLen >> 8);
-                    returnPacket[3] = (byte)(ipLen & 0xFF);
-                    
-                    returnPacket[10] = 0;
-                    returnPacket[11] = 0;
-                    int checksum = calculateChecksum(returnPacket, ihl);
-                    returnPacket[10] = (byte)(checksum >> 8);
-                    returnPacket[11] = (byte)(checksum & 0xFF);
-                    
-                    // Synchronize writing back to the VPN interface
-                    synchronized (out) {
-                        out.write(returnPacket);
-                    }
-                }
+                ByteBuffer dnsData = ByteBuffer.allocate(length - ihl - 8);
+                packet.position(ihl + 8);
+                dnsData.put(packet);
+                dnsData.flip();
+                channel.write(dnsData);
+                
+                channel.register(selector, SelectionKey.OP_READ, new DnsContext(hostname, packet, ihl, vpnFd));
+                return; // Buffer released by selector thread or context logic
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {} finally { releaseBuffer(packet); }
     }
 
-    private int calculateChecksum(byte[] buf, int length) {
-        int i = 0, sum = 0, len = length;
-        while (len > 1) {
-            sum += (((buf[i] << 8) & 0xFF00) | (buf[i + 1] & 0xFF));
-            i += 2;
-            len -= 2;
+    private void sendResponsePacket(ByteBuffer req, int ihl, byte[] dnsResp, FileDescriptor vpnFd) {
+        ByteBuffer resp = obtainBuffer();
+        try {
+            int totalLen = ihl + 8 + dnsResp.length;
+            req.rewind();
+            resp.put(req.array(), 0, ihl + 8);
+            resp.position(ihl + 8);
+            resp.put(dnsResp);
+            
+            // Swap IPs (Machine Level)
+            resp.put(12, req.get(16)); resp.put(13, req.get(17)); resp.put(14, req.get(18)); resp.put(15, req.get(19));
+            resp.put(16, req.get(12)); resp.put(17, req.get(13)); resp.put(18, req.get(14)); resp.put(19, req.get(15));
+            
+            // Swap Ports
+            resp.put(ihl, req.get(ihl + 2)); resp.put(ihl + 1, req.get(ihl + 3));
+            resp.put(ihl + 2, req.get(ihl)); resp.put(ihl + 3, req.get(ihl + 1));
+            
+            resp.putShort(ihl + 4, (short)(dnsResp.length + 8));
+            resp.putShort(2, (short)totalLen);
+            resp.putShort(10, (short)0);
+            
+            // --- Phase 6: Vectorized Checksum ---
+            int checksum = calculateChecksum(resp, ihl);
+            resp.putShort(10, (short)checksum);
+            
+            resp.position(0);
+            resp.limit(totalLen);
+            synchronized (vpnFd) { Os.write(vpnFd, resp); }
+        } catch (Exception ignored) {} finally { releaseBuffer(resp); }
+    }
+
+    private int calculateChecksum(ByteBuffer buf, int length) {
+        int sum = 0;
+        buf.rewind();
+        LongBuffer lb = buf.asLongBuffer();
+        // Read 8 bytes at a time (Phase 6)
+        while (lb.hasRemaining() && length >= 8) {
+            long l = lb.get();
+            sum += (int)(l >>> 32) + (int)(l & 0xFFFFFFFFL);
+            length -= 8;
         }
-        if (len > 0) sum += (buf[i] << 8 & 0xFF00);
-        while ((sum >> 16) > 0) sum = (sum & 0xFFFF) + (sum >> 16);
+        buf.position(buf.limit() - length);
+        while (length > 1) {
+            sum += (buf.getShort() & 0xFFFF);
+            length -= 2;
+        }
+        if (length > 0) sum += ((buf.get() & 0xFF) << 8);
+        while ((sum >>> 16) != 0) sum = (sum & 0xFFFF) + (sum >>> 16);
         return ~sum & 0xFFFF;
     }
 
-    private String parseDnsHostname(byte[] data, int offset, int totalLength) {
+    private String parseDnsHostnameFast(ByteBuffer data, int offset, int total) {
         try {
-            StringBuilder sb = new StringBuilder();
-            int p = offset + 12;
-            while (p < totalLength) {
-                int len = data[p] & 0xFF;
-                if (len == 0) break;
-                if (sb.length() > 0) sb.append(".");
-                for (int i = 0; i < len; i++) {
-                    if (p + 1 + i < totalLength) sb.append((char) data[p + 1 + i]);
-                }
-                p += len + 1;
+            byte[] name = new byte[256];
+            int len = 0, p = offset + 12;
+            while (p < total) {
+                int l = data.get(p) & 0xFF;
+                if (l == 0) break;
+                if (len > 0) name[len++] = '.';
+                for (int i=0; i<l; i++) name[len++] = data.get(p + 1 + i);
+                p += l + 1;
             }
-            return sb.toString();
+            return new String(name, 0, len, StandardCharsets.US_ASCII);
         } catch (Exception e) { return null; }
     }
 
-    // SAFE & OPTIMIZED BLOCKLIST
     private boolean isBlocked(String hostname) {
-        if (hostname == null || hostname.isEmpty()) return false;
-        String lower = hostname.toLowerCase();
-        
-        // Exact matches or proper subdomains to prevent breaking random sites
-        return lower.equals("doubleclick.net") || lower.endsWith(".doubleclick.net") ||
-               lower.equals("google-analytics.com") || lower.endsWith(".google-analytics.com") ||
-               lower.startsWith("ads.") || lower.startsWith("ad.") ||
-               lower.contains(".ads.") || lower.contains("-ads.");
+        if (hostname == null) return false;
+        String[] parts = hostname.toLowerCase().split("\\.");
+        TrieNode curr = TRIE_ROOT;
+        for (int i = parts.length - 1; i >= 0; i--) {
+            curr = curr.children.get(parts[i]);
+            if (curr == null) return false;
+            if (curr.isLeaf) return true;
+        }
+        return false;
     }
 
     private void logActivity(String hostname, boolean blocked) {
-        if (hostname == null || hostname.isEmpty()) return;
         String entry = (blocked ? "BLOCKED:" : "RESOLVED:") + hostname;
+        int idx = ringIndex.getAndIncrement() % MAX_ACTIVITY_LOGS;
+        activityRingBuffer[idx] = entry;
         
+        // Sync legacy list for UI
         synchronized (recentActivity) {
-            if (!recentActivity.isEmpty() && recentActivity.get(0).equals(entry)) return;
-            recentActivity.add(0, entry);
-            if (recentActivity.size() > MAX_ACTIVITY_LOGS) recentActivity.remove(MAX_ACTIVITY_LOGS);
+            recentActivity.clear();
+            for (String s : activityRingBuffer) if (s != null) recentActivity.add(s);
         }
     }
 
-    private String[] getDnsForProvider(String provider) {
-        String[] dns = DNS_PROVIDERS.get(provider);
-        return (dns != null) ? dns : DNS_PROVIDERS.get("AdGuard DNS");
+    private String[] getDnsForProvider(String p) {
+        return DNS_PROVIDERS.getOrDefault(p, DNS_PROVIDERS.get("AdGuard DNS"));
     }
 
     private void stopVpn() {
         stopForeground(true);
-        if (vpnThread != null) {
-            vpnThread.interrupt();
-            vpnThread = null;
-        }
-        if (executorService != null) {
-            executorService.shutdownNow();
-            executorService = null;
-        }
-        if (vpnInterface != null) {
-            try { vpnInterface.close(); } catch (IOException ignored) {}
-            vpnInterface = null;
-        }
+        if (vpnThread != null) vpnThread.interrupt();
+        if (executorService != null) executorService.shutdownNow();
+        if (vpnInterface != null) try { vpnInterface.close(); } catch (IOException ignored) {}
+        if (selector != null) try { selector.close(); } catch (IOException ignored) {}
+        vpnInterface = null; selector = null;
     }
 
-    @Override
-    public void onDestroy() { stopVpn(); super.onDestroy(); }
-
-    @Override
-    public void onRevoke() { stopVpn(); super.onRevoke(); }
+    @Override public void onDestroy() { stopVpn(); super.onDestroy(); }
+    @Override public void onRevoke() { stopVpn(); super.onRevoke(); }
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel serviceChannel = new NotificationChannel(CHANNEL_ID, "Pickko VPN Service", NotificationManager.IMPORTANCE_LOW);
             NotificationManager manager = getSystemService(NotificationManager.class);
-            if (manager != null) manager.createNotificationChannel(serviceChannel);
+            if (manager != null) manager.createNotificationChannel(new NotificationChannel(CHANNEL_ID, "Shield", NotificationManager.IMPORTANCE_LOW));
         }
     }
 }

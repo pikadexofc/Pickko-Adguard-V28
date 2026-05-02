@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "355842435614",
+    "project_id": "studio-473807792-cf2c0",
+    "storage_bucket": "studio-473807792-cf2c0.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:355842435614:android:172ac20bf2c176e32adc0f",
+        "android_client_info": {
+          "package_name": "com.pickko.adguard"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAIqMXdpL7jcRixs_zuHNV5tJoXvPGwBlI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
