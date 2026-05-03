@@ -12,6 +12,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.VpnService;
+import android.os.Build;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -235,6 +236,25 @@ public class VpnPlugin extends Plugin {
                 call.resolve(ret);
             } catch (Exception e) { call.reject(e.getMessage()); }
         }).start();
+    }
+
+    @PluginMethod
+    public void requestBatteryOptimizationExemption(PluginCall call) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Intent intent = new Intent();
+            String packageName = getContext().getPackageName();
+            android.os.PowerManager pm = (android.os.PowerManager) getContext().getSystemService(Context.POWER_SERVICE);
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                intent.setAction(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                intent.setData(android.net.Uri.parse("package:" + packageName));
+                getContext().startActivity(intent);
+                call.resolve();
+            } else {
+                call.resolve();
+            }
+        } else {
+            call.resolve();
+        }
     }
 
     @ActivityCallback

@@ -196,17 +196,6 @@ public class LocalVpnService extends VpnService {
                 return;
             }
 
-            byte[] dnsData = new byte[length - ihl - 8];
-            System.arraycopy(packet, ihl + 8, dnsData, 0, dnsData.length);
-            
-            // ... (rest of method)
-
-            byte[] cachedVal = DNS_RESULT_CACHE.get(host);
-            if (cachedVal != null) {
-                sendResponse(packet, ihl, cachedVal, out);
-                return;
-            }
-
             byte[] dnsReqData = new byte[length - ihl - 8];
             System.arraycopy(packet, ihl + 8, dnsReqData, 0, dnsReqData.length);
 
@@ -262,6 +251,8 @@ public class LocalVpnService extends VpnService {
 
     private void sendNxDomainResponse(byte[] req, int ihl, FileOutputStream out) throws IOException {
         // DNS Header for NXDOMAIN (Name Error)
+        if (req.length < ihl + 8 + 12) return; // Safety check
+
         byte[] nxData = new byte[12];
         System.arraycopy(req, ihl + 8, nxData, 0, 12); // Copy original ID
         nxData[2] = (byte) 0x81; // Response, recursive
@@ -275,11 +266,16 @@ public class LocalVpnService extends VpnService {
         int p = ihl + 8 + 12;
         while (p < req.length) {
             int len = req[p] & 0xFF;
-            if (len == 0) { p += 5; break; } // Null terminator + Type/Class (4 bytes)
+            if (len == 0) { 
+                if (p + 4 < req.length) p += 5; // Null terminator + Type/Class (4 bytes)
+                break; 
+            }
             p += len + 1;
         }
         
         int questionLen = p - (ihl + 8 + 12);
+        if (questionLen <= 0 || p > req.length) return; // Malformed packet
+
         byte[] fullNx = new byte[12 + questionLen];
         System.arraycopy(nxData, 0, fullNx, 0, 12);
         System.arraycopy(req, ihl + 8 + 12, fullNx, 12, questionLen);
@@ -301,6 +297,7 @@ public class LocalVpnService extends VpnService {
             while (p < total) {
                 int len = d[p] & 0xFF;
                 if (len == 0) break;
+                if (p + 1 + len > total) break; // Bounds check
                 if (sb.length() > 0) sb.append(".");
                 for (int i=0; i<len; i++) sb.append((char)d[p+1+i]);
                 p += len + 1;
