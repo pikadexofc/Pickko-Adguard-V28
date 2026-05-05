@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Pickko Adguard</string>
+    <string name="title_activity_main">Pickko Adguard</string>
+    <string name="package_name">com.pickko.adguard</string>
+    <string name="custom_url_scheme">com.pickko.adguard</string>
+</resources>
