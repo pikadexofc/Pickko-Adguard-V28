@@ -1,4 +1,3 @@
-import React from 'react';
 
 export const Logo = ({ className = "w-12 h-12", color = "#CEFF00" }: { className?: string; color?: string }) => {
   return (
